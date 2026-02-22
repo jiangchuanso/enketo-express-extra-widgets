@@ -1,78 +1,29 @@
-name: Build Extra Widgets from enketo/enketo and update tag in devops repo
+name: Build and Push Multi-Arch Docker Image
 
 on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  # 允许手动触发
   workflow_dispatch:
-    inputs:
-      base_image_tag:
-        description: 'Base enketo image tag'
-        required: true
-        type: string
-      short_sha:
-        description: 'Short SHA from enketo repo'
-        required: true
-        type: string
-      branch:
-        description: 'Branch name'
-        required: true
-        type: string
-        default: 'main'    
 
 env:
-  CI_REGISTRY_IMAGE: ghcr.io/kobotoolbox/ee-extra-widgets
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: write
-    outputs:
-      enketo_image_tag: ${{ env.TAG_NAME }}
-    env:
-      TAG_NAME: ${{ format('{0}-{1}', inputs.branch, inputs.short_sha) }}
-      BASE_TAG: ${{ inputs.base_image_tag }}    
+      id-token: write
+
     steps:
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.KOBO_BOT_APP_ID }}
-          private-key: ${{ secrets.KOBO_BOT_PRIVATE_KEY }}
-          owner: kobotoolbox
-          repositories: enketo-express-extra-widgets
-
-      - name: Checkout ee-extra-widgets
-        uses: actions/checkout@v6
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-
-      - name: Update Dockerfile FROM line
-        run: |
-          echo "Updating Dockerfile to use base image: $BASE_TAG"
-          sed -i "s|FROM .*|FROM $BASE_TAG|" Dockerfile
-          echo "Updated Dockerfile:"
-          cat Dockerfile
-
-      - name: Verify base image exists
-        run: |
-          echo "Verifying base image: $BASE_TAG"
-          docker manifest inspect $BASE_TAG || {
-            echo "ERROR: Base image does not exist or is not accessible"
-            exit 1
-          }
-
-      - name: Commit Dockerfile changes
-        run: |
-          git config user.name '${{ steps.app-token.outputs.app-slug }}[bot]'
-          git config user.email '${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com'
-
-          git add Dockerfile
-
-          git diff --staged --quiet && echo "No changes" || {
-            git commit -m "Update base image to $BASE_TAG"
-            git push origin main
-            echo " Pushed Dockerfile changes"
-          }
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -82,64 +33,36 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      - name: Log into registry ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push multi-arch image
-        uses: docker/build-push-action@v6
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=,suffix=,format=short
+
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.CI_REGISTRY_IMAGE }}:${{ env.TAG_NAME }}
-            ${{ env.CI_REGISTRY_IMAGE }}:latest
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Output image details
-        run: |
-          echo "### Build complete!" >> $GITHUB_STEP_SUMMARY
-          echo "**Image**: \`${{ env.CI_REGISTRY_IMAGE }}:${{ env.TAG_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Platforms**: linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
-
-  trigger-main-deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.KOBO_BOT_APP_ID }}
-          private-key: ${{ secrets.KOBO_BOT_PRIVATE_KEY }}
-          owner: kobotoolbox
-          repositories: devops
-
-      - name: Trigger kfmain deploy build
-        uses: benc-uk/workflow-dispatch@v1
-        with:
-          workflow: deploy-kfmain.yml
-          repo: kobotoolbox/devops
-          ref: instance/kfmain
-          token: ${{ steps.app-token.outputs.token }}
-          inputs: |
-            {
-              "enketo_image_tag": "${{ needs.build.outputs.enketo_image_tag }}"
-            }
-
-  notify-failure:
-    needs:
-      - build
-      - trigger-main-deploy
-    if: ${{ always() && (needs.build.result == 'failure' || needs.trigger-main-deploy.result == 'failure') }}
-    uses: kobotoolbox/kpi/.github/workflows/zulip.yml@main
-    secrets: inherit
-    with:
-      topic: "EE-extra-widgets builds"
-      stream: "Enketo"
-      content: ":warning: @*devs*, EE-extra-widgets build [run #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) failed"
+          # 确保构建参数和秘密不会泄露
+          provenance: false
